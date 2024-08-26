@@ -1,0 +1,81 @@
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#include "defines.h"
+#include "../utils/glsl/rendering_utils.glsl"
+
+layout(constant_id = 0) const uint SPHERICAL_HARMONIC_ORDER = 1;
+layout(constant_id = 1) const uint ENTRIES_PER_VERTEX = 3;
+
+layout(push_constant) uniform PushConstant{
+    layout(offset = 0) DrawBuffer db;
+};
+
+#define CONV_VERTEX_BUFFER_BINDING DRAW_DESC_VERTEX_BUFFER_BINDING
+#define CONV_VERTEX_BUFFER_SET 0
+#include "../convenience/glsl/vertex_data.glsl"
+
+layout(binding = DRAW_DESC_TARGET_RADIANCE_BUFFER_BINDING, set = 0) buffer target_radiance_storage_buffer { float target_radiance_buffer[]; };
+layout(binding = DRAW_DESC_TARGET_RADIANCE_WEIGHTS_BUFFER_BINDING, set = 0) buffer target_radiance_weight_storage_buffer { float target_radiance_weights_buffer[]; };
+
+
+#define SH_READ
+#define SH_DATA_BUFFER_ target_radiance_buffer
+#include "../sphericalharmonics/sphericalharmonics.glsl"
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+void main() {
+    const uint coord = gl_GlobalInvocationID.x;
+    const Vertex_s vertex = vertex_buffer[db.vertexOffset + coord];
+
+    const vec3 vpos_ws = vec3(db.modelMatrix * vec4(vertex.position.xyz, 1.0));
+    vec3 vn_ws = normalize(mat3(transpose(inverse(db.modelMatrix))) * vertex.normal.xyz);
+    vec3 vt_ws = normalize(mat3(transpose(inverse(db.modelMatrix))) * vertex.tangent.xyz);
+
+    if ( abs(dot(vn_ws, vn_ws)-1.0) > 1e-5 ) vn_ws = normalize( vn_ws );
+    if ( abs(dot(vt_ws, vt_ws)-1.0) > 1e-5 || abs(dot(vn_ws, vt_ws)) > 1e-5 || any(isnan(vt_ws)) ) vt_ws = normalize( getPerpendicularVector(vn_ws) ); 
+
+    const float dist = length(db.positionWS.xyz - vpos_ws);
+    if(db.drawAll || dist <= db.radius) {
+        const uint idx = (db.vertexOffset + coord) * ENTRIES_PER_VERTEX;
+
+        float nDotN = dot(vn_ws.xyz, db.normal.xyz);
+        if(nDotN < 0) nDotN = 0.0;
+        float ratio = db.softBrush ? (dist / db.radius) * nDotN : 0.0f;
+
+        const float oldWeight = target_radiance_weights_buffer[db.vertexOffset + coord];
+        const vec3 oldColor = vec3(target_radiance_buffer[idx + 0], target_radiance_buffer[idx + 1], target_radiance_buffer[idx + 2]);
+        if(db.drawALPHA) target_radiance_weights_buffer[db.vertexOffset + coord] = mix(db.color.w, oldWeight, ratio);
+#ifndef USE_SPHERICAL_HARMONICS
+            if(db.drawRGB) {
+                target_radiance_buffer[idx + 0] = mix(db.color.x, oldColor.x, ratio);
+                target_radiance_buffer[idx + 1] = mix(db.color.y, oldColor.y, ratio);
+                target_radiance_buffer[idx + 2] = mix(db.color.z, oldColor.z, ratio);
+            }
+#else
+            const vec3 inDir = normalize(db.originWS - vpos_ws);
+               
+            [[unroll, dependency_infinite]]
+            for (int l = 0; l <= SPHERICAL_HARMONIC_ORDER; l++) {
+                
+                const float smoothing = 1.0f / (1.0f + db.radius * float((l * (l + 1)) * (l * (l + 1)))); 
+                [[unroll, dependency_infinite]]
+                for (int m = -l; m <= l; m++) {
+
+                    const uint shIdx = getSHindex(l, m);
+
+                    float shWeight = 0.0f;
+                    if(dot(inDir, vn_ws) > 1e-5) { shWeight = evalHSH(l, m, inDir, vn_ws, vt_ws) * smoothing; }
+
+                    [[unroll, dependency_infinite]]
+                    for (uint i = 0; i < 3; i++) { 
+                        if(db.drawRGB) {
+                            target_radiance_buffer[idx + shIdx * 3 + i] = shWeight * db.color[i]; 
+                        }
+                    }
+                }
+            }
+#endif
+    }
+}

@@ -1,0 +1,853 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_debug_printf : enable
+#extension GL_ARB_gpu_shader_int64 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+
+#define printf(px,py,s,v) if(gl_LaunchIDEXT.x == px &&  gl_LaunchIDEXT.y == py) debugPrintfEXT(s, v);
+#define debugPrintf if(gl_LaunchIDEXT.x == ubo.debugPixelPosition.x &&  gl_LaunchIDEXT.y == ubo.debugPixelPosition.y) debugPrintfEXT
+
+#include "defines.h"
+#define DEBUG_PRINT_BXDF_CHECK_NAN 1
+#include "../utils/glsl/bsdf/bsdf.glsl"
+#include "../utils/glsl/bsdf/volume.glsl"
+
+#include "../utils/glsl/pixel_filter.glsl"
+#include "../utils/glsl/tone_mapping.glsl"
+#include "../utils/glsl/random.glsl"
+
+
+#define CONV_TEXTURE_BINDING BINDLESS_IMAGE_DESC_BINDING
+#define CONV_TEXTURE_SET BINDLESS_IMAGE_DESC_SET
+#include "../convenience/glsl/texture_data.glsl"
+
+
+layout(binding = GLOBAL_DESC_UBO_BINDING, set = GLOBAL_DESC_SET) uniform global_ubo { GlobalUbo_s ubo; };
+
+#define CONV_INDEX_BUFFER_BINDING GLOBAL_DESC_INDEX_BUFFER_BINDING
+#define CONV_INDEX_BUFFER_SET GLOBAL_DESC_SET
+#define CONV_VERTEX_BUFFER_BINDING GLOBAL_DESC_VERTEX_BUFFER_BINDING
+#define CONV_VERTEX_BUFFER_SET GLOBAL_DESC_SET
+#include "../convenience/glsl/vertex_data.glsl"
+
+#define CONV_TLAS_BINDING GLOBAL_DESC_AS_BINDING
+#define CONV_TLAS_SET GLOBAL_DESC_SET
+#define CONV_GEOMETRY_BUFFER_BINDING GLOBAL_DESC_GEOMETRY_DATA_BINDING
+#define CONV_GEOMETRY_BUFFER_SET GLOBAL_DESC_SET
+#include "../convenience/glsl/as_data.glsl"
+
+#define CONV_MATERIAL_BUFFER_BINDING GLOBAL_DESC_MATERIAL_BUFFER_BINDING
+#define CONV_MATERIAL_BUFFER_SET GLOBAL_DESC_SET
+#include "../convenience/glsl/material_data.glsl"
+
+#define CONV_LIGHT_BUFFER_BINDING GLSL_GLOBAL_LIGHT_DATA_BINDING
+#define CONV_LIGHT_BUFFER_SET GLOBAL_DESC_SET
+#include "../convenience/glsl/light_data.glsl"
+
+layout(binding = GLSL_GLOBAL_RT_OUT_IMAGE_BINDING, set = GLOBAL_DESC_SET, rgba8) uniform image2D output_image;
+layout(binding = GLSL_GLOBAL_RT_ACC_IMAGE_BINDING, set = GLOBAL_DESC_SET, rgba32f) uniform image2D acc_image;
+layout(binding = GLSL_GLOBAL_RT_ACC_C_IMAGE_BINDING, set = GLOBAL_DESC_SET, r32f) uniform image2D acc_c_image;
+layout(binding = GLSL_GLOBAL_DEBUG_IMAGE_BINDING, set = GLOBAL_DESC_SET, rgba8) uniform image2D debug_image;
+
+layout(binding = BINDLESS_CUBE_IMAGE_DESC_BINDING, set = BINDLESS_CUBE_IMAGE_DESC_SET) uniform samplerCube cube_map[];
+
+#include "payload.glsl"
+layout(location = 0) rayPayloadEXT RayPayload rp;
+layout(location = 1) rayPayloadEXT ShadowRayPayload srp;
+
+#define FLT_MAX 3.402823466e+38
+
+struct Ray {
+	vec3 	origin, direction;
+	float 	t_min, t_max;
+};
+
+
+struct HitData {
+	vec4 	albedo;
+	vec3	emission;
+	float 	occlusion;				
+	vec3 	hit_pos_ws;				
+	uint 	id;						
+	vec3 	o_geo_n_ws_norm;		
+	vec3 	geo_n_ws_norm;			
+	vec3 	n_ws_norm;				
+	float 	metallic;				
+	vec3 	nmap_n_ws_norm;			
+	float 	roughness;
+	vec3	view_pos_ws;			
+	float 	view_dist;				
+	vec3	wi_ws_norm;				
+	vec3 	t_ws_norm;				
+	float	eta_int;				
+	vec3 	b_ws_norm;				
+	float	eta_ext;				
+	vec3	attenuation_color;
+	float	attenuation_dist;
+	vec2	tex_coords_0;	
+	float 	transmission;
+	float	attenuation_anisotropy;
+	bool	is_emissive;
+	bool	is_double_sided;
+	float 	area;
+	uint	light_type;				
+};
+
+
+struct MediumData
+{
+    vec3 color;
+    bool inside;
+    float density;
+    float anisotropy;
+};
+struct BounceData {
+	vec3 throughput;
+	int depth;
+	vec3 wo_ws_norm;
+	float pdf;
+	vec3 weight;
+	float min_ray_pdf;
+	bool do_mis;
+	MediumData medium;
+};
+
+uint32_t seed; 
+
+
+vec2 getScreenCoordinates(const vec2 sample_radius, out float sample_weight){
+	
+	vec2 pSampleOffset = (vec2(tea_nextFloat(seed), tea_nextFloat(seed)) * 2.0f * sample_radius) - sample_radius;
+	vec2 pSamplePos = vec2(gl_LaunchIDEXT.xy) + vec2(0.5); 	
+	pSamplePos += pSampleOffset;							
+	const vec2 inUV = pSamplePos/vec2(gl_LaunchSizeEXT.xy);
+	const vec2 screenCoordClipSpace  = inUV * 2.0 - 1.0;
+
+	
+	sample_weight = ApplyPixelFilter(ubo.pixel_filter_type, pSampleOffset, sample_radius, ubo.pixel_filter_extra);
+	return screenCoordClipSpace;
+}
+
+Ray getRay(const vec2 sccs)
+{
+	const vec4 origin = ubo.inverseViewMat * vec4(0,0,0,1);
+	const vec4 target = ubo.inverseProjMat * vec4(sccs.x, sccs.y, 1, 1) ;
+	const vec4 direction = ubo.inverseViewMat * vec4(normalize(target.xyz), 0) ;
+
+	Ray ray;
+	ray.origin = origin.xyz;
+	ray.direction = normalize(direction.xyz);
+	ray.t_min = ubo.fr_tmin;
+	ray.t_max = ubo.fr_tmax;
+	return ray;
+}
+
+/*
+** BSDFs
+*/
+#define LAMBERT_BRDF 0
+float brdf_pdf(in vec3 wi, in vec3 wo, in HitData hd){
+	BsdfScatterEvent e = { wi, eLobeAll, hd.geo_n_ws_norm, hd.nmap_n_ws_norm, hd.metallic, hd.albedo.xyz, hd.roughness, hd.transmission, hd.eta_ext, hd.eta_int, hd.is_double_sided };
+#if LAMBERT_BRDF
+	return lambert_brdf_pdf(e, wo);
+#else
+	return metalroughness_pdf(e, wo);
+#endif
+}
+bool brdf_sample(inout BounceData bd, in HitData hd){
+	BsdfScatterEvent e = { hd.wi_ws_norm, eLobeAll, hd.geo_n_ws_norm, hd.nmap_n_ws_norm, hd.metallic, hd.albedo.xyz, hd.roughness, hd.transmission, hd.eta_ext, hd.eta_int, hd.is_double_sided };
+#if LAMBERT_BRDF
+	return lambert_brdf_sample(e, tea_nextFloat2(seed), bd.wo_ws_norm, bd.pdf, bd.weight);
+#else
+	return metalroughness_sample(e, tea_nextFloat4(seed), tea_nextFloat3(seed), bd.wo_ws_norm, bd.pdf, bd.weight);
+#endif
+}
+vec3 brdf_eval(in vec3 wi, in vec3 wo, in HitData hd){
+	BsdfScatterEvent e = { wi, eLobeAll, hd.geo_n_ws_norm, hd.nmap_n_ws_norm, hd.metallic, hd.albedo.xyz, hd.roughness, hd.transmission, hd.eta_ext, hd.eta_int, hd.is_double_sided };
+#if LAMBERT_BRDF
+	return lambert_brdf_eval(e, wo);
+#else
+	return metalroughness_eval(e, wo);
+#endif
+}
+
+uint prevLightIndex;
+uint prevLightTriangleIndex;
+vec3 evalLight(uint index, in HitData hd, inout BounceData bd){
+	Light_s light = light_buffer[index];
+
+	float lpdf = 0;
+	float weight = 0;
+	float area = 0;
+	
+	const uint type = light.type;
+	const vec3 f_v_dir_norm = normalize(hd.view_pos_ws - hd.hit_pos_ws);	
+
+	vec3 f_l_dir; 
+	vec3 f_l_dir_norm;
+	float f_l_dist;
+	bd.do_mis = false;
+	if(isPunctualLight(index)) {
+		if(isDirectionalLight(index)) f_l_dir = -1 * light.n_ws_norm.xyz;
+		else f_l_dir = light.pos_ws.xyz - hd.hit_pos_ws;
+		lpdf = 1;
+		
+		float value = 1;
+		if(light.light_offset > 0.0f) {
+			if(isDirectionalLight(index)) {
+				const float angle = radians(light.light_offset);
+				const vec2 offset = sampleUnitDiskConcentric(vec2(tea_nextFloat(seed), tea_nextFloat(seed))) / 2.0f;
+				const vec3 l_t_ws_norm = getPerpendicularVector(light.n_ws_norm.xyz );
+				const vec3 l_b_ws_norm = cross(light.n_ws_norm.xyz , l_t_ws_norm);
+				const vec4 dir = vec4(light.n_ws_norm.xyz, 1) * rotationMatrix(l_t_ws_norm, angle * offset.x);
+				f_l_dir = -(dir * rotationMatrix(l_b_ws_norm, angle * offset.y)).xyz;
+			}
+			
+			else {
+				const float radius = light.light_offset;
+#if 1 
+				const vec3 hdir = sampleUnitHemisphereUniform(vec2(tea_nextFloat2(seed)));
+				const vec3 pos = light.pos_ws.xyz + tangentSpaceToWorldSpace(hdir, -normalize(f_l_dir)) * radius;
+				const vec3 ln = normalize(pos - light.pos_ws.xyz);
+				f_l_dir = pos - hd.hit_pos_ws;
+				value *= max(0, dot(-normalize(f_l_dir), ln));
+				lpdf *= M_2PI;
+				bd.do_mis = true;
+#else 
+#endif
+				
+				
+				
+				
+			}
+		} else value *= WATT_TO_RADIANT_INTENSITY(1);
+		f_l_dir_norm = normalize(f_l_dir);
+		f_l_dist = length(f_l_dir);
+
+		float attenuation = 1.0f;
+		float angularAttenuation = 1.0f;
+		if(!isDirectionalLight(index)) {
+			attenuation = ATTENUATION_RANGE(f_l_dist, light.range);
+		}
+		
+		if(isSpotLight(index)){
+			float cd = dot(light.n_ws_norm.xyz, -1 * f_l_dir_norm);
+			angularAttenuation = clamp(cd * light.light_angle_scale + light.light_angle_offset,0.0,1.0);
+			angularAttenuation *= angularAttenuation;
+		}
+		lpdf /= attenuation;
+		weight = value * (light.intensity) * angularAttenuation;
+	} else if(isIesLight(index)) {
+		lpdf = 1;
+		f_l_dir = light.pos_ws.xyz - hd.hit_pos_ws;
+		float value = 1;
+		if(light.light_offset > 0.0f) {
+			const float radius = light.light_offset;
+			const vec3 hdir = sampleUnitHemisphereUniform(vec2(tea_nextFloat2(seed)));
+			const vec3 pos = light.pos_ws.xyz + tangentSpaceToWorldSpace(hdir, -normalize(f_l_dir)) * radius;
+			const vec3 ln = normalize(pos - light.pos_ws.xyz);
+			f_l_dir = pos - hd.hit_pos_ws;
+			value *= max(0, dot(-normalize(f_l_dir), ln));
+			lpdf *= M_2PI;
+			bd.do_mis = true;
+		} else value *= WATT_TO_RADIANT_INTENSITY(1);
+
+		f_l_dir_norm = normalize(f_l_dir);
+		f_l_dist = length(f_l_dir);
+		float attenuation = ATTENUATION_RANGE(f_l_dist, light.range);
+		lpdf /= attenuation;
+		weight = value * (light.intensity * evalIesLightBilinear(index, -f_l_dir_norm));
+	} else if(isSurfaceLight(index)){
+		light.color *= (light.intensity/M_4PI);
+		const vec3 l_t_ws_norm = light.t_ws_norm.xyz;
+		const vec3 l_b_ws_norm = cross(l_t_ws_norm, light.n_ws_norm.xyz);
+		if(isHyperrectangularLight(index)){
+			const vec2 offset = (tea_nextFloat2(seed) - 0.5f) * light.dimensions.xy;
+			light.pos_ws.xyz += l_t_ws_norm * offset.x + l_b_ws_norm * offset.y;
+			area = light.dimensions.x * light.dimensions.y; /*rectangle area*/
+			bd.do_mis = true;
+		}else {
+			vec2 radius = light.dimensions.xy * 0.5f;
+			vec2 offset = sampleUnitDiskConcentric(tea_nextFloat2(seed)) * radius;
+			light.pos_ws.xyz += tangentSpaceToWorldSpace(vec3(offset, 0), l_t_ws_norm, l_b_ws_norm, light.n_ws_norm.xyz);
+			area = M_PI * radius.x * radius.y; /*disk area*/
+		}
+		f_l_dir = light.pos_ws.xyz - hd.hit_pos_ws;
+		f_l_dist = length(f_l_dir);
+		f_l_dir_norm = f_l_dir / f_l_dist;
+
+		
+		
+		
+		
+		
+		
+
+		if (light.double_sided == 0) {
+			
+			if(dot(light.n_ws_norm.xyz, -f_l_dir_norm) <= 0.0f) return vec3(0.0f);
+		}
+		weight = 1.0f;
+		
+		lpdf = 1.0f/(dot(light.n_ws_norm.xyz,-f_l_dir_norm) / (f_l_dist * f_l_dist));
+	}
+	else if(isTriangleMeshLight(index)) {
+		
+		if(hd.id == light.id) return vec3(0);
+
+		const int tri_idx = sampleRangeUniform(1, int(light.triangle_count), tea_nextFloat(seed)) - 1;
+		prevLightTriangleIndex = tri_idx;
+		const vec3 bary = sampleUnitTriangleUniform(tea_nextFloat2(seed));
+		
+		uint idx_0 = 0;
+		uint idx_1 = 0;
+		uint idx_2 = 0;
+		if(light.index_buffer_offset != uint(-1)){
+			idx_0 = index_buffer[light.index_buffer_offset + (tri_idx * 3) + 0];
+			idx_1 = index_buffer[light.index_buffer_offset + (tri_idx * 3) + 1];
+			idx_2 = index_buffer[light.index_buffer_offset + (tri_idx * 3) + 2];
+		} else {
+			idx_0 = (tri_idx * 3) + 0;
+			idx_1 = (tri_idx * 3) + 1;
+			idx_2 = (tri_idx * 3) + 2;
+		}
+		mat4x4 mat = mat4(light.pos_ws, light.n_ws_norm, light.t_ws_norm, vec4(0,0,0,1));
+		mat = transpose(mat);
+		
+		vec3 pos_ws;
+		{
+			vec3 v_0 = (mat * vertex_buffer[light.vertex_buffer_offset + idx_0].position).xyz;
+			vec3 v_1 = (mat * vertex_buffer[light.vertex_buffer_offset + idx_1].position).xyz;
+			vec3 v_2 = (mat * vertex_buffer[light.vertex_buffer_offset + idx_2].position).xyz;
+			pos_ws = (vec4(bary.x * v_0 + bary.y * v_1 + bary.z * v_2, 1)).xyz;
+
+			f_l_dir = pos_ws.xyz - hd.hit_pos_ws;
+			f_l_dist = length(f_l_dir);
+			f_l_dir_norm = f_l_dir / f_l_dist;
+
+			vec3 n = cross((v_1 - v_0),(v_2 - v_0));
+			float len = length(n);
+			area = (abs(len/2.0f));
+
+			if (light.double_sided == 0) {
+				
+				if(dot(n, -f_l_dir_norm) <= 0.0f) return vec3(0.0f);
+			}
+		}
+		
+		vec3 n_ws_norm;
+		{
+			mat3 normal_mat = mat3(transpose(inverse(mat)));
+			vec3 n_0 = vertex_buffer[light.vertex_buffer_offset + idx_0].normal.xyz;
+			vec3 n_1 = vertex_buffer[light.vertex_buffer_offset + idx_1].normal.xyz;
+			vec3 n_2 = vertex_buffer[light.vertex_buffer_offset + idx_2].normal.xyz;
+			n_ws_norm = normalize(normal_mat * (n_0 * bary.x + n_1 * bary.y + n_2 * bary.z));
+		}
+		
+		light.color *= light.intensity;
+		if(light.texture_index != -1){
+			vec2 uv_0 = vertex_buffer[light.vertex_buffer_offset + idx_0].texture_coordinates_0.xy;
+			vec2 uv_1 = vertex_buffer[light.vertex_buffer_offset + idx_1].texture_coordinates_0.xy;
+			vec2 uv_2 = vertex_buffer[light.vertex_buffer_offset + idx_2].texture_coordinates_0.xy;
+			vec2 uv = (bary.x * uv_0 + bary.y * uv_1 + bary.z * uv_2);
+			
+			light.color *= texture(texture_sampler[light.texture_index], uv).xyz;
+		}
+
+		weight = 1 * float(light.triangle_count);
+		lpdf = areaToSolidAngle(area, f_l_dist, abs(dot(n_ws_norm.xyz,-f_l_dir_norm)));
+		bd.do_mis = true;
+	}
+	
+
+	
+	bd.do_mis = bd.do_mis && (hd.roughness != 0.0f) && (ubo.max_depth != 1);
+	if(!ubo.light_geometry && !isTriangleMeshLight(index)) bd.do_mis = false;
+	float mis = 1.0f;
+	if(bd.do_mis) {
+#if defined(SAMPLE_LIGHTS)
+		mis = 0.5f;
+#elif defined(SAMPLE_LIGHTS_MIS)
+		float brdf_pdf = brdf_pdf(f_v_dir_norm, f_l_dir_norm, hd);
+		if(brdf_pdf == 0) return vec3(0);
+		mis = misBalanceHeuristic(lpdf, brdf_pdf);
+#endif
+	}
+
+	srp.visible = 1.0f;
+	traceRayEXT(tlas, gl_RayFlagsTerminateOnFirstHitEXT, 0xff, 2, 0, 1, hd.hit_pos_ws, ubo.sr_tmin, f_l_dir_norm, f_l_dist + ubo.sr_tmax_offset, 1);
+	if(srp.visible == 0.0f) return vec3(0);
+
+	vec3 brdf = brdf_eval(f_v_dir_norm, f_l_dir_norm, hd);
+	return bd.throughput * ((brdf * light.color * weight)/lpdf) * mis;
+}
+
+vec3 directLight(in HitData hd, inout BounceData bd){
+	vec3 result = vec3(0);
+	if(ubo.light_count == 0) return result;
+
+	const int index = sampleRangeUniform(1, int(ubo.light_count), tea_nextFloat(seed)) - 1;
+	prevLightIndex = index;
+	result += evalLight(index, hd, bd) * ubo.light_count;
+	return result;
+}
+
+void getHitData(out HitData hd, const Ray ray, uint depth){
+
+	const GeometryData_s geometry_data = geometry_buffer[rp.customIndex + rp.geometryIndex];
+	hd.view_pos_ws = ray.origin;
+
+	if((geometry_data.flags & eGeoDataLightBit) > 0) { 
+		hd.id = geometry_data.data_index;
+		Light_s light = light_buffer[geometry_data.data_index];
+
+		hd.occlusion = 1.0f;
+		hd.hit_pos_ws = ray.origin + ray.direction * rp.hit_distance;
+		hd.wi_ws_norm = hd.view_pos_ws - hd.hit_pos_ws;
+		hd.view_dist = length(hd.wi_ws_norm);
+		hd.wi_ws_norm = hd.wi_ws_norm / hd.view_dist;
+
+		hd.is_double_sided = true;
+
+		if(isPunctualLight(geometry_data.data_index) || isIesLight(geometry_data.data_index)) {
+			hd.o_geo_n_ws_norm = hd.geo_n_ws_norm = hd.n_ws_norm = hd.nmap_n_ws_norm = normalize(hd.hit_pos_ws - light.pos_ws.xyz);
+			hd.t_ws_norm = getPerpendicularVector(hd.n_ws_norm);
+			hd.b_ws_norm = normalize(cross(hd.n_ws_norm, hd.t_ws_norm));
+
+			if(isPointLight(geometry_data.data_index)) {
+				hd.emission = (light.color * light.intensity);
+				
+				
+			} else if(isSpotLight(geometry_data.data_index)) {
+				hd.emission = (light.color * light.intensity);
+				float cd = 0.0f;
+				if(depth == 1) cd = dot(light.n_ws_norm.xyz, hd.n_ws_norm);
+				else cd = dot(light.n_ws_norm.xyz, hd.wi_ws_norm);
+				float angularAttenuation = clamp(cd * light.light_angle_scale + light.light_angle_offset, 0.0, 1.0);
+				angularAttenuation *= angularAttenuation;
+				hd.emission *= angularAttenuation;
+				
+			} else if(isIesLight(geometry_data.data_index)) {
+				hd.emission = light.color * light.intensity;
+				if(depth == 1) hd.emission *= evalIesLightBilinear(geometry_data.data_index, hd.n_ws_norm);
+				else hd.emission *= evalIesLightBilinear(geometry_data.data_index, hd.wi_ws_norm);
+			}
+			hd.emission *= 1.0f/(M_2PI * M_2PI * light.light_offset * light.light_offset);
+			hd.area = M_4PI * light.light_offset * light.light_offset;
+			hd.light_type = HD_POINT_LIGHT;
+		} else if (isSurfaceLight(geometry_data.data_index)) {
+			hd.area = light.dimensions.x * light.dimensions.y;
+			hd.emission = (light.color * (light.intensity/M_4PI)); 
+			hd.emission /= hd.area;
+			hd.o_geo_n_ws_norm = hd.geo_n_ws_norm = hd.n_ws_norm = hd.nmap_n_ws_norm = light.n_ws_norm.xyz;
+			hd.t_ws_norm = light.t_ws_norm.xyz;
+			hd.b_ws_norm = cross(light.n_ws_norm.xyz, hd.t_ws_norm.xyz);
+			hd.is_double_sided = light.double_sided > 0;
+			hd.light_type = HD_SURFACE_LIGHT;
+
+			if(hd.is_double_sided && dot(hd.geo_n_ws_norm, hd.wi_ws_norm) < 0) {
+				hd.geo_n_ws_norm = hd.n_ws_norm = hd.nmap_n_ws_norm = -hd.geo_n_ws_norm;
+			}
+		}
+
+		hd.albedo = vec4(hd.emission,1);
+
+		hd.eta_ext = 1.0f;
+		hd.eta_int = 1.5f;
+		hd.metallic = 0.0f;
+		hd.roughness = 1.0f;
+		
+		const float dottt = dot(hd.wi_ws_norm, hd.geo_n_ws_norm);
+	
+		hd.transmission = 0.0f;
+		hd.is_emissive = true;
+		return;
+	}
+	vec3 barycentricCoords = computeBarycentric(rp.hitAttribute);
+	const Material_s material = material_buffer[geometry_data.data_index];
+
+	hd.id = rp.customIndex;
+	hd.is_double_sided = material.isDoubleSided;
+	hd.light_type = 0;
+
+	
+	uint idx_0 = 0;
+	uint idx_1 = 0;
+	uint idx_2 = 0;
+	if((geometry_data.flags & eGeoDataIndexedTriangleBit) > 0){
+		idx_0 = index_buffer[geometry_data.index_buffer_offset + (rp.primitiveID * 3) + 0];
+		idx_1 = index_buffer[geometry_data.index_buffer_offset + (rp.primitiveID * 3) + 1];
+		idx_2 = index_buffer[geometry_data.index_buffer_offset + (rp.primitiveID * 3) + 2];
+	} else {
+		idx_0 = (rp.primitiveID * 3) + 0;
+		idx_1 = (rp.primitiveID * 3) + 1;
+		idx_2 = (rp.primitiveID * 3) + 2;
+	}
+	{
+		
+		vec4 v_0 = geometry_data.model_matrix * vertex_buffer[geometry_data.vertex_buffer_offset + idx_0].position;
+		vec4 v_1 = geometry_data.model_matrix * vertex_buffer[geometry_data.vertex_buffer_offset + idx_1].position;
+		vec4 v_2 = geometry_data.model_matrix * vertex_buffer[geometry_data.vertex_buffer_offset + idx_2].position;
+		hd.hit_pos_ws = (v_0 * barycentricCoords.x + v_1 * barycentricCoords.y + v_2 * barycentricCoords.z).xyz;
+		hd.geo_n_ws_norm = cross((v_1.xyz - v_0.xyz), (v_2.xyz - v_0.xyz));
+		const float normal_length = length(hd.geo_n_ws_norm);
+		hd.geo_n_ws_norm = hd.geo_n_ws_norm / normal_length;
+		hd.area = abs(normal_length / 2.0f);
+	}
+	hd.wi_ws_norm = hd.view_pos_ws - hd.hit_pos_ws;
+	hd.view_dist = length(hd.wi_ws_norm);
+	hd.wi_ws_norm = hd.wi_ws_norm / hd.view_dist;
+	{
+		
+		hd.o_geo_n_ws_norm = hd.geo_n_ws_norm;
+		vec3 n_0 = vertex_buffer[geometry_data.vertex_buffer_offset + idx_0].normal.xyz;
+		vec3 n_1 = vertex_buffer[geometry_data.vertex_buffer_offset + idx_1].normal.xyz;
+		vec3 n_2 = vertex_buffer[geometry_data.vertex_buffer_offset + idx_2].normal.xyz;
+		mat3 normal_mat = mat3(transpose(inverse(geometry_data.model_matrix )));
+		hd.n_ws_norm = normalize(normal_mat * (n_0 * barycentricCoords.x + n_1 * barycentricCoords.y + n_2 * barycentricCoords.z));
+		if(any(isnan(hd.n_ws_norm))) debugPrintfEXT("nan normal %d", rp.instanceID);
+
+		hd.eta_ext = 1.0f;
+		hd.eta_int = material.ior;
+		if(hd.is_double_sided && dot(hd.geo_n_ws_norm, hd.wi_ws_norm) < 0) {
+			hd.geo_n_ws_norm = -hd.geo_n_ws_norm;
+			hd.n_ws_norm = -hd.n_ws_norm;
+
+		}
+
+		
+		vec3 t_0 = vertex_buffer[geometry_data.vertex_buffer_offset + idx_0].tangent.xyz;
+		vec3 t_1 = vertex_buffer[geometry_data.vertex_buffer_offset + idx_1].tangent.xyz;
+		vec3 t_2 = vertex_buffer[geometry_data.vertex_buffer_offset + idx_2].tangent.xyz;
+		hd.t_ws_norm = normalize(normal_mat * (t_0 * barycentricCoords.x + t_1 * barycentricCoords.y + t_2 * barycentricCoords.z));
+		if (dot(hd.t_ws_norm, hd.t_ws_norm) < 0.5f || abs(dot(hd.n_ws_norm, hd.t_ws_norm)) > 1e-5) hd.t_ws_norm = getPerpendicularVector(hd.n_ws_norm); 
+		
+
+		
+		hd.b_ws_norm = normalize(cross(hd.n_ws_norm, hd.t_ws_norm));
+	}
+	{
+		
+		vec2 uv_0 = vertex_buffer[geometry_data.vertex_buffer_offset + idx_0].texture_coordinates_0.xy;
+		vec2 uv_1 = vertex_buffer[geometry_data.vertex_buffer_offset + idx_1].texture_coordinates_0.xy;
+		vec2 uv_2 = vertex_buffer[geometry_data.vertex_buffer_offset + idx_2].texture_coordinates_0.xy;
+		hd.tex_coords_0 = uv_0 * barycentricCoords.x + uv_1 * barycentricCoords.y + uv_2 * barycentricCoords.z;
+	}
+	
+	
+	{
+		hd.albedo = vec4(1);
+		if(material.baseColorTexIdx != -1){
+			
+			
+			
+			
+			
+
+			
+			
+
+			
+			
+			
+			
+			
+			
+
+			hd.albedo = (texture(texture_sampler[material.baseColorTexIdx], hd.tex_coords_0));
+		}
+		hd.albedo *= material.baseColorFactor;
+	}
+	
+	{
+		hd.occlusion = 1.0f;
+		if(material.occlusionTexIdx != -1){
+			hd.occlusion = texture(texture_sampler[material.occlusionTexIdx], hd.tex_coords_0).r;
+			hd.occlusion *= material.occlusionStrength;
+		}
+	}
+	
+	{
+		hd.nmap_n_ws_norm = hd.n_ws_norm;
+		if(material.normalTexIdx != -1){
+			vec3 n_nmap_ts = texture(texture_sampler[material.normalTexIdx], hd.tex_coords_0).xyz;
+			hd.nmap_n_ws_norm = nTangentSpaceToWorldSpace(n_nmap_ts, material.normalScale, hd.n_ws_norm);
+		}
+	}
+	
+	{
+		hd.metallic = 1.0f;
+		if(material.metallicTexIdx != -1){
+			hd.metallic = texture(texture_sampler[material.metallicTexIdx], hd.tex_coords_0).r;
+		}
+		hd.metallic *= material.metallicFactor;
+	}
+	
+	{
+		hd.roughness = 1.0f;
+		if(material.roughnessTexIdx != -1){
+			hd.roughness = texture(texture_sampler[material.roughnessTexIdx], hd.tex_coords_0).r;
+		}
+		hd.roughness *= material.roughnessFactor;
+		
+		
+		
+		
+		hd.roughness *= hd.roughness;
+	}
+	
+	{
+		if(depth == 1) hd.emission = vec3(1.0);
+		else hd.emission = material.emissionFactor;
+		if(material.emissionTexIdx != -1){
+			hd.emission *= texture(texture_sampler[material.emissionTexIdx], hd.tex_coords_0).xyz;
+		}
+		if(depth != 1) hd.emission *= material.emissionStrength;
+	}
+	
+	hd.attenuation_color = material.attenuationColor;
+	hd.attenuation_dist = material.attenuationDistance;
+	hd.attenuation_anisotropy = material.attenuationAnisotropy;
+	
+	
+	
+	
+	
+	
+	
+	{
+		hd.transmission = material.transmissionFactor;
+		if(material.transmissionTexIdx != -1){
+			hd.transmission *= texture(texture_sampler[material.transmissionTexIdx], hd.tex_coords_0).r;
+		}
+	}
+
+	hd.is_emissive = material.isEmissive;
+}
+
+float getMisWeightBrdf(uint lightIndex, in HitData hd, in BounceData bd) {
+	if(bd.pdf == 0.0f) return 1;
+	Light_s light = light_buffer[lightIndex];
+	float light_pdf = 0;
+	if(hd.light_type == HD_POINT_LIGHT && (isPunctualLight(lightIndex) || isIesLight(lightIndex))) {
+		if(light.light_offset > 0.0f) {
+			if(isPointLight(lightIndex) || isIesLight(lightIndex) || isSpotLight(lightIndex)) {
+				
+				const float radius = light.light_offset;
+				light_pdf = M_2PI * (hd.view_dist * hd.view_dist);
+				
+				
+				
+			} else return 1;
+		} else return 1;
+	} else if(hd.light_type == HD_SURFACE_LIGHT && isSurfaceLight(lightIndex)) {
+		
+		light_pdf = 1.0f/(abs(dot(hd.o_geo_n_ws_norm, hd.wi_ws_norm)) / (hd.view_dist * hd.view_dist));
+	} else if(hd.is_emissive) {
+		
+		
+		
+		light_pdf = areaToSolidAngle(hd.area, hd.view_dist, abs(dot(hd.o_geo_n_ws_norm, hd.wi_ws_norm)));
+	}
+	return misBalanceHeuristic(bd.pdf, light_pdf);
+}
+
+bool shade(inout vec3 out_color, inout Ray ray, inout BounceData bd) 
+{
+	out_color = vec3(0,0,0);
+	rp.instanceID = -1;
+	uint rayFlags = gl_RayFlagsNoneEXT;
+	if(bd.depth == 1) {
+		if(ubo.cull_mode == 1) rayFlags = gl_RayFlagsCullFrontFacingTrianglesEXT;
+		if(ubo.cull_mode == 2) rayFlags = gl_RayFlagsCullBackFacingTrianglesEXT;
+	}
+
+	uint mask = 0xff;
+	traceRayEXT(tlas, rayFlags, mask, 0, 0, 0, ray.origin.xyz, ray.t_min, ray.direction.xyz, ray.t_max, 0);
+
+	if(rp.instanceID == -1 /* miss */) {
+		
+		
+		if(!ubo.env_shade && bd.depth > 1) return false;
+		else out_color += bd.throughput * srgbToLinear(ubo.bg.xyz);
+		return false; 
+	} else {
+		
+		HitData hd;
+		getHitData(hd, ray, bd.depth);
+		
+		hd.albedo.xyz *= hd.occlusion;
+
+		
+		
+		
+		
+		
+		
+		const float filter_glossy = (ubo.filter_glossy == 0.0f) ? FLT_MAX : 1.0f / ubo.filter_glossy;
+		if(filter_glossy != FLT_MAX && hd.roughness != 0.0f) {
+			const float blur_pdf = filter_glossy * bd.min_ray_pdf;
+			if(blur_pdf < 1.0f) {
+				const float blur_roughness = sqrt(1.0f - blur_pdf) * 0.5f;
+				hd.roughness = max(hd.roughness, blur_roughness);
+			}
+		}
+
+		if(!ubo.shade) {
+			out_color.xyz = hd.albedo.xyz;
+			return false;
+		}
+
+		if(bd.medium.inside) {
+			
+			
+			
+			const float scatterDist = min(sampleDistance(hd.attenuation_dist, tea_nextFloat(seed)), hd.view_dist);
+			const bool mediumSampled = scatterDist < hd.view_dist;
+			if (mediumSampled)
+			{
+				bd.throughput *= exp(-bd.medium.density * scatterDist * (1.0f - bd.medium.color));
+				
+				ray.origin += ray.direction * scatterDist;
+
+				const vec2 spherical = hgSample(-ray.direction, bd.medium.anisotropy, tea_nextFloat2(seed));
+				const vec3 cartesian = normalize(sphericalToCartesian(vec3(1, spherical.xy)));
+    			const vec3 scatterDir = normalize(tangentSpaceToWorldSpace(cartesian, -ray.direction));
+				const float pdf = hgPhaseFunction(dot(-ray.direction, scatterDir), bd.medium.anisotropy);
+				bd.wo_ws_norm = ray.direction = scatterDir;
+				bd.min_ray_pdf = min(bd.min_ray_pdf, pdf);
+
+				
+				if(ubo.rrpt != -1 && ubo.rrpt < bd.depth) {
+					const float p = min(max(bd.throughput.r, max(bd.throughput.g, bd.throughput.b)), 0.95f);
+					if (tea_nextFloat(seed) >= p || p == 0.0f) return false;
+					bd.throughput /= p; 
+				}
+
+				return true;
+			}
+
+		}
+
+		
+		
+		float mis = 1.0f;
+		if(bd.do_mis) {
+#if defined(SAMPLE_LIGHTS)
+			mis = 0.5f;
+#elif defined(SAMPLE_LIGHTS_MIS)
+			mis = getMisWeightBrdf(prevLightIndex, hd, bd);		
+#endif
+		}
+
+		
+		if(hd.is_emissive && dot(hd.geo_n_ws_norm, hd.wi_ws_norm) > 0.0f) {
+			out_color.xyz += mis * bd.throughput * hd.emission;
+		}
+
+		
+		if(ubo.rrpt != -1 && ubo.rrpt < bd.depth) {
+			const float p = min(max(bd.throughput.r, max(bd.throughput.g, bd.throughput.b)), 0.95f);
+			if (tea_nextFloat(seed) >= p || p == 0.0f) return false;
+			bd.throughput /= p; 
+		}
+
+		
+		bd.do_mis = false;
+		
+#if defined(SAMPLE_LIGHTS) || defined(SAMPLE_LIGHTS_MIS)
+		out_color.xyz += directLight(hd, bd);
+#endif
+
+		
+		if(!brdf_sample(bd, hd)) return false;
+		ray = Ray(hd.hit_pos_ws, bd.wo_ws_norm, ubo.br_tmin, ubo.br_tmax);
+		bd.min_ray_pdf = min(bd.min_ray_pdf, bd.pdf);
+
+		bd.throughput *= bd.weight;
+		if(isnan(bd.pdf)) debugPrintfEXT("NAN: bd.pdf");
+		if(isinf(bd.pdf)) debugPrintfEXT("INF: bd.pdf");
+		if(any(isnan(bd.weight))) debugPrintfEXT("NAN: bd.weight");
+		if(any(isnan(bd.throughput))) debugPrintfEXT("NAN: bd.throughput");
+		if(any(isnan(ray.direction))) debugPrintfEXT("NAN: ray.direction");
+
+
+		
+		
+		
+		const float sample_clamp_direct = (ubo.clamp_direct == 0.0f) ? FLT_MAX : ubo.clamp_direct * 3.0f;
+		const float sample_clamp_indirect = (ubo.clamp_indirect == 0.0f) ? FLT_MAX : ubo.clamp_indirect * 3.0f;
+		const float limit = (bd.depth == 1) ? sample_clamp_direct : sample_clamp_indirect;
+  		const float sum = abs(out_color.x) + abs(out_color.y) + abs(out_color.z);
+		if (sum > limit) out_color *= limit / sum;
+
+		
+		if(hd.attenuation_dist > 0.0f) {
+			if(!bd.medium.inside && dot(hd.o_geo_n_ws_norm,ray.direction) < 0.0f) {
+				bd.medium = MediumData(hd.attenuation_color, true, hd.attenuation_dist /* density */, hd.attenuation_anisotropy /* anisotropy */ );
+			}
+			else bd.medium = MediumData(vec3(0.0f), false, 0.0f, 0.0f);
+		}
+
+		return true; 
+	}
+}
+
+void main() {
+	
+	seed = tea_init(uint(gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x + gl_LaunchIDEXT.x), uint(ubo.frameIndex));
+	
+	imageStore(debug_image, ivec2(gl_LaunchSizeEXT), vec4(0,0,0, 1));
+
+	
+	vec4 out_linear = vec4(0);
+	vec2 pixel_sample_radius = vec2(ubo.pixel_filter_width * 0.5f);
+	float pixel_sample_weights_sum = 0;
+	for(int i = 0; i < ubo.pixelSamplesPerFrame; i++){
+		vec3 pSample = vec3(0);
+		
+		float pixel_sample_weight;
+		const vec2 sccs = getScreenCoordinates(pixel_sample_radius, pixel_sample_weight);
+		Ray ray = getRay(sccs);
+		
+		BounceData bd = {/*throughput*/ vec3(1), /*depth*/ 0, /*wo*/ vec3(ray.direction), /*pdf*/ 1, /*weight*/ vec3(0), /* min_ray_pdf */ FLT_MAX, /* do_mis */ false, 
+			MediumData(vec3(0.0f), false, 0.0f, 0.0f) };
+		
+		for(int j = 0; (j < ubo.max_depth || ubo.max_depth == -1); j++){
+			bd.depth += 1;
+			vec3 out_color = vec3(0,0,0);
+			bool hit = shade(out_color, ray, bd);
+			pSample += out_color;
+			if(!hit || !ubo.shade) break;
+		}
+		pixel_sample_weights_sum += pixel_sample_weight;
+		out_linear += vec4(pSample * pixel_sample_weight, 1);
+	}
+
+	
+	if(ubo.accumulate){
+		out_linear = out_linear + imageLoad(acc_image, ivec2(gl_LaunchIDEXT.xy));
+		pixel_sample_weights_sum = pixel_sample_weights_sum + imageLoad(acc_c_image, ivec2(gl_LaunchIDEXT.xy)).x;
+	}
+	imageStore(acc_image, ivec2(gl_LaunchIDEXT.xy), out_linear);
+	imageStore(acc_c_image, ivec2(gl_LaunchIDEXT.xy), vec4(pixel_sample_weights_sum));
+	
+	out_linear = out_linear / pixel_sample_weights_sum;
+	
+	out_linear *= ubo.exposure_film; 
+	
+	out_linear.xyz = ApplyTonemapping(ubo.tone_mapping_type, out_linear.xyz, luminance(vec3(1)));
+	
+	if(ubo.exposure_tm != 0.0f) out_linear.xyz *= pow(2,ubo.exposure_tm); 
+	
+	vec3 out_srgb = linearToSRGB(out_linear.xyz);
+	
+	if(ubo.gamma_tm != 1.0f) out_srgb = pow(out_srgb, vec3(1.0 / ubo.gamma_tm));
+	
+	
+	out_srgb = dither(out_srgb, ubo.dither_strength, randomFloatTriDist(vec2(tea_nextFloat(seed), tea_nextFloat(seed))));
+	
+	if(out_linear.w > 0) imageStore(output_image, ivec2(gl_LaunchIDEXT.xy), vec4(out_srgb, 1));
+}

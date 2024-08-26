@@ -1,0 +1,455 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_shader_atomic_float : require
+#extension GL_EXT_debug_printf : enable
+
+#include "defines.h"
+#include "../utils/glsl/ray_tracing_utils.glsl"
+#include "../utils/glsl/rendering_utils.glsl"
+
+#ifdef USE_DOUBLE_ON_GPU
+	#define vec4_ dvec4
+	#define vec3_ dvec3
+	#define vec2_ dvec2
+	#define scalar double
+#else
+	#define vec4_ vec4
+	#define vec3_ vec3
+	#define vec2_ vec2
+	#define scalar float
+#endif
+
+
+#define CONV_TEXTURE_BINDING GLSL_GLOBAL_IMAGE_BINDING
+#define CONV_TEXTURE_SET GLSL_GLOBAL_IMAGE_DESC_SET
+
+
+
+
+
+layout(binding = GLSL_GLOBAL_UBO_BINDING, set = GLSL_GLOBAL_DESC_SET) uniform global_ubo { AuxiliaryUbo ubo; };
+layout(binding = GLSL_GLOBAL_INSTANCE_DATA_BINDING, set = GLSL_GLOBAL_DESC_SET) buffer instance_ssbo { InstanceSSBO instance_buffer[]; };
+layout(binding = GLSL_GLOBAL_GEOMETRY_DATA_BINDING, set = GLSL_GLOBAL_DESC_SET) buffer geometry_ssbo { GeometrySSBO geometry_buffer[]; };
+struct vertex_s {
+	vec4	position;
+	vec4	normal;	
+	vec4	tangent;
+
+	vec2	texture_coordinates_0;
+	vec2	texture_coordinates_1;
+	vec4	color_0;
+};
+
+
+layout(binding = GLSL_GLOBAL_INDEX_BUFFER_BINDING, set = GLSL_GLOBAL_DESC_SET) buffer index_storage_buffer { uint index_buffer[]; };
+layout(binding = GLSL_GLOBAL_VERTEX_BUFFER_BINDING, set = GLSL_GLOBAL_DESC_SET) buffer vertex_storage_buffer { vertex_s vertex_buffer[]; };
+
+layout(binding = GLSL_GLOBAL_AS_BINDING, set = GLSL_GLOBAL_DESC_SET) uniform accelerationStructureEXT topLevelAS;
+
+layout(binding = GLSL_GLOBAL_OUT_IMAGE_BINDING, set = GLSL_GLOBAL_DESC_SET) buffer transport_storage_buffer { scalar transport_buffer[]; };
+layout(binding = GLSL_GLOBAL_AREA_DATA_BINDING, set = GLSL_GLOBAL_DESC_SET) buffer triangle_area_storage_buffer { scalar triangle_area_buffer[]; };
+
+layout(binding = GLSL_GLOBAL_EMISSION_DATA_BINDING, set = GLSL_GLOBAL_DESC_SET) buffer vertex_emission_storage_buffer { scalar vertex_emission_buffer[]; };
+layout(binding = GLSL_GLOBAL_ABSORPTION_DATA_BINDING, set = GLSL_GLOBAL_DESC_SET) buffer vertex_absorption_storage_buffer { scalar vertex_absorption_buffer[]; };
+
+#include "payload.glsl"
+layout(location = 0) rayPayloadEXT RayPayload rp;
+
+struct Ray {
+	vec3 origin, direction;
+	vec3 bar_coord;
+	float t_min, t_max;
+	float weight;
+	bool absorbed;
+};
+
+const float _origin = 1.0f / 32.0f;
+const float _float_scale = 1.0f / 65536.0f;
+const float _int_scale = 256.0f;
+
+
+vec3 offset_ray(const vec3 p, const vec3 n)
+{
+	ivec3 of_i = ivec3(_int_scale * n.x, _int_scale * n.y, _int_scale * n.z);
+
+	vec3 p_i = vec3(
+		intBitsToFloat(floatBitsToInt(p.x)+((p.x < 0) ? -of_i.x : of_i.x)), 
+		intBitsToFloat(floatBitsToInt(p.y)+((p.y < 0) ? -of_i.y : of_i.y)),
+		intBitsToFloat(floatBitsToInt(p.z)+((p.z < 0) ? -of_i.z : of_i.z))); 
+
+	return vec3(
+		abs(p.x) < _origin ? p.x+_float_scale*n.x : p_i.x, 
+		abs(p.y) < _origin ? p.y+_float_scale*n.y : p_i.y, 
+		abs(p.z) < _origin ? p.z+_float_scale*n.z : p_i.z); 
+}
+
+uvec4 getThreadTriangleIndices() {
+	uint thread_id = gl_LaunchIDEXT.y;
+	uvec4 vertex_indices = uvec4(0, 0, 0, 0);
+
+	bool stop = false;
+	uint triangle_count = 0;
+	for(uint i=0; i<ubo.instanceCount; i++) {	
+		InstanceSSBO instance_data = instance_buffer[i];		
+		for(uint j=0; j<instance_data.geometryCount; j++) {
+			GeometrySSBO geometry_data = geometry_buffer[instance_data.geometry_buffer_offset + j];
+			if(thread_id < (triangle_count + geometry_data.triangleCount)) { 
+				uint triangle_offset = thread_id - triangle_count;
+				
+				/*
+				if(thread_id < triangle_count)
+				{
+					debugPrintfEXT("ERROR %d >= %d, ID: %d", thread_id, triangle_count, gl_LaunchIDEXT.y);
+					return uvec4(0, 0, 0, 0);
+				} else {
+					if(gl_LaunchIDEXT.y == 0)
+						debugPrintfEXT("OK");
+				}
+				*/
+					
+				if(geometry_data.has_indices) {
+					
+					uint indices_offset = geometry_data.index_buffer_offset + triangle_offset * 3;
+					vertex_indices.x = geometry_data.vertex_buffer_offset + index_buffer[indices_offset + 0];
+					vertex_indices.y = geometry_data.vertex_buffer_offset + index_buffer[indices_offset + 1];
+					vertex_indices.z = geometry_data.vertex_buffer_offset + index_buffer[indices_offset + 2];
+				}
+				else {					
+					uint offset = triangle_offset * 3;
+					vertex_indices.x = geometry_data.vertex_buffer_offset + offset + 0;
+					vertex_indices.y = geometry_data.vertex_buffer_offset + offset + 1;
+					vertex_indices.z = geometry_data.vertex_buffer_offset + offset + 2;
+				}
+				vertex_indices.w = i;
+				stop = true;
+				break;
+			}
+			triangle_count += geometry_data.triangleCount;
+		}
+		if(stop)
+			break;
+	}
+
+	return vertex_indices;
+}
+
+vec3 getNormal(uvec4 _vertex_indices)
+{	
+	vertex_s v0 = vertex_buffer[_vertex_indices.x];	
+	vertex_s v1 = vertex_buffer[_vertex_indices.y];	
+	vertex_s v2 = vertex_buffer[_vertex_indices.z];
+		
+	mat4 model_matrix = instance_buffer[_vertex_indices.w].model_matrix;
+		
+	vec4 p0 = model_matrix * v0.position;	
+	vec4 p1 = model_matrix * v1.position;
+	vec4 p2 = model_matrix * v2.position;
+
+	vec3 normal = normalize(cross(p1.xyz-p0.xyz, p2.xyz-p1.xyz));
+
+	return normal;
+}
+
+/*
+vec3 _computeBarycentric(vec2 hitAttribute) {
+	vec3 coord = vec3((scalar(1.0) - hitAttribute.x) - hitAttribute.y, hitAttribute.x, hitAttribute.y);    
+	return coord;
+}
+
+vec3 _sampleUnitTriangleUniform(vec2 uv) {
+	if(uv.x < 0)
+		debugPrintfEXT("rand < 0 ... WRONG");	
+	const scalar sqrt_u = sqrt(uv.x);
+	return vec3(scalar(1.0) - sqrt_u, sqrt_u * (scalar(1.0) - uv.y), sqrt_u * uv.y);
+}
+*/
+
+vec3 rand(inout uint _seed)
+{
+	return vec3(randomFloat(_seed), randomFloat(_seed), randomFloat(_seed));
+	
+}
+
+Ray getEmissionRay(uvec4 _vertex_indices, scalar ray_weight, inout uint _seed)
+{
+	vec3 barycentricCoords = sampleUnitTriangleUniform(rand(_seed).xy);
+	
+	scalar sum = barycentricCoords.x+barycentricCoords.y+barycentricCoords.z;
+	if(sum > 1.000001)
+		debugPrintfEXT("#%d | getEmissionRay | barycentricCoords sum(%f) > 1.000001: %f, %f, %f", gl_LaunchIDEXT.y, sum, barycentricCoords.x, barycentricCoords.y, barycentricCoords.z);	
+
+	vertex_s v0 = vertex_buffer[_vertex_indices.x];	
+	vertex_s v1 = vertex_buffer[_vertex_indices.y];	
+	vertex_s v2 = vertex_buffer[_vertex_indices.z];
+	
+	InstanceSSBO instance = instance_buffer[_vertex_indices.w];
+	
+	vec4 origin = vec4(v0.position * barycentricCoords.x + v1.position * barycentricCoords.y + v2.position * barycentricCoords.z);
+	origin = instance.model_matrix * origin;
+			
+	vec3 normal = getNormal(_vertex_indices);
+	
+	Ray ray;
+	ray.origin = offset_ray(origin.xyz, normal);
+	ray.direction = normal;
+	ray.bar_coord = barycentricCoords;
+	ray.t_min = 0.0;
+	ray.t_max = 10000.0f;
+	
+	ray.absorbed = false;	
+	
+	if(instance.diffuseEmission == 1) {
+		if(instance.traceBoundingCone) 
+		{
+			
+			vec3 bsc = ubo.boundingSphereCenter;
+			float r = ubo.boundingSphereRadius;
+			vec3 dir = bsc-ray.origin;
+			float dir_length = length(dir);
+			if(dir_length <= r)			
+			{			
+				debugPrintfEXT("dir_length: %f", dir_length);
+				vec3 rnd_direction = sampleUnitHemisphereUniform(rand(_seed).xy);				
+				ray.direction = tangentSpaceToWorldSpace(rnd_direction, normal);
+			}
+			else
+			{	
+				float n_dot = acos(max(0.0f, dot(normal, normalize(dir))));
+				float thetaMax = max(0.0f, asin(r / dir_length));
+				float cosThetaMax = cos(thetaMax+n_dot);
+				vec3 rnd_direction = sampleUnitConeUniform(rand(_seed).xy, cosThetaMax);
+				ray.direction = tangentSpaceToWorldSpace(rnd_direction, normal);
+			}
+		}
+		else{
+			vec3 rnd_direction = sampleUnitHemisphereUniform(rand(_seed).xy);
+			ray.direction = tangentSpaceToWorldSpace(rnd_direction, normal);
+		}
+	} else {
+		ray.direction = normal;
+	}
+	
+	return ray;
+}
+
+Ray getNextRay(uvec4 _vertex_indices, vec3 _inDir, scalar ray_weight, inout uint _seed)
+{
+	vec3 barycentricCoords = sampleUnitTriangleUniform(rand(_seed).xy);
+	
+	scalar sum = barycentricCoords.x+barycentricCoords.y+barycentricCoords.z;
+	if(sum > 1.000001)
+		debugPrintfEXT("#%d | getNextRay | barycentricCoords sum(%f) > 1.000001: %f, %f, %f", gl_LaunchIDEXT.y, sum, barycentricCoords.x, barycentricCoords.y, barycentricCoords.z);	
+
+	vertex_s v0 = vertex_buffer[_vertex_indices.x];	
+	vertex_s v1 = vertex_buffer[_vertex_indices.y];	
+	vertex_s v2 = vertex_buffer[_vertex_indices.z];
+	
+	InstanceSSBO instance = instance_buffer[_vertex_indices.w];
+	
+	vec4 origin = vec4(v0.position * barycentricCoords.x + v1.position * barycentricCoords.y + v2.position * barycentricCoords.z);
+	origin = instance.model_matrix * origin;
+		
+	vec3 normal = getNormal(_vertex_indices);
+
+	
+	Ray ray;
+	ray.origin = offset_ray(origin.xyz, normal);
+	ray.direction = normal;
+	ray.bar_coord = barycentricCoords;
+	ray.t_min = 0.0;
+	ray.t_max = 10000.0f;	
+	
+	ray.absorbed = false;
+
+	vec3 randvec = rand(_seed);
+	float rnd = randvec.x;
+
+	/*if(rnd > instance.diffuseReflectance + instance.specularReflectance) {	
+		ray.absorbed = true;
+	} else if(rnd > instance.diffuseReflectance) {							
+		ray.direction = reflect(normalize(_inDir), normal);
+		ray.weight *= instance.specularReflectance;
+	} else {																	
+		vec3 rnd_direction = sampleUnitHemisphereUniform(vec2(randomFloat(_seed), randomFloat(_seed)));
+		ray.direction = tangentSpaceToWorldSpace(rnd_direction, normal);
+		ray.weight *= instance.diffuseReflectance;
+	}*/
+
+	if(rnd < instance.diffuseReflectance) {	
+		vec3 rnd_direction = sampleUnitHemisphereUniform(randvec.yz);
+		ray.direction = tangentSpaceToWorldSpace(rnd_direction, normal);
+		ray.weight *= instance.diffuseReflectance;		
+	} else if(rnd >= instance.diffuseReflectance && rnd < instance.specularReflectance) {							
+		ray.direction = reflect(normalize(_inDir), normalize(normal));
+		ray.weight *= instance.specularReflectance;
+	} else {																
+		ray.absorbed = true;
+	}
+
+	return ray;
+}
+
+void main() 
+{	
+	uint seed = initRandomSeed(gl_LaunchIDEXT.y, ubo.batchSeed);
+
+	if(gl_LaunchIDEXT.y == 0)
+	{
+		debugPrintfEXT("shader PRINTF test");
+		uvec2 ind = linTo2D(11, 5);
+		debugPrintfEXT("index test: %d == 11, ubo.vertexCount: %d", linFrom2D(ind.x, ind.y, 5), ubo.vertexCount);
+				
+		debugPrintfEXT("boundingSphereCenter: (%f, %f, %f)", ubo.boundingSphereCenter.x, ubo.boundingSphereCenter.y, ubo.boundingSphereCenter.z);		
+		debugPrintfEXT("boundingSphereRadius: %f", ubo.boundingSphereRadius);
+	}	
+	
+	
+	uvec4 ray_vertex_indices = getThreadTriangleIndices();
+		
+	
+	
+	
+
+	float triangle_area = triangle_area_buffer[gl_LaunchIDEXT.y];
+
+	
+
+	uint ray_count = ubo.rayCount;
+
+#ifdef WEIGHT_RAY_COUNT_BY_AREA
+	ray_count = max(ray_count, uint(ceil(ray_count * triangle_area)));
+#endif
+
+	scalar ray_weight = triangle_area / scalar(ray_count); 
+
+	
+	for(uint n=0; n<ray_count; n++)
+	{
+		uint depth = 0;		
+		
+		seed += n;
+		Ray ray = getEmissionRay(ray_vertex_indices, ray_weight, seed);			
+		vec3 ray_bar_coord = ray.bar_coord;
+
+		uvec4 hit_vertex_indices = ray_vertex_indices;
+		vec3 hit_bar_coord = ray.bar_coord;
+						
+		for(uint i=0; i<3; i++)
+		{
+			uint ray_vertex_index = ray_vertex_indices[i];
+			uint transport_mat_diag = linFrom2D(ray_vertex_index, ray_vertex_index, ubo.vertexCount);
+			scalar emission = 0.0;
+			#ifdef USE_QUANTIZED_RAY_TRANSPORT			
+				emission = 3.0;
+			#else	
+				emission = scalar(ray_bar_coord[i]) * ray_weight;
+			#endif
+
+			#ifdef FULL_TRANSPORT_IN_SHADER	
+				emission *= vertex_emission_buffer[ray_vertex_index] * vertex_absorption_buffer[ray_vertex_index];
+			#endif
+			
+			atomicAdd(transport_buffer[transport_mat_diag], -emission);
+		}
+
+		while(true)
+		{		
+			depth += 1;
+			rp.instanceID = -1;
+			traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, 0xff, 0, 0, 0, ray.origin, ray.t_min, ray.direction, ray.t_max, 0);
+						
+			if(rp.instanceID > -1) {
+
+				hit_bar_coord = computeBarycentric(rp.hitAttribute);
+
+				InstanceSSBO instance_data = instance_buffer[rp.instanceID];
+
+				if(instance_data.traceable == 0)
+					break;
+
+				GeometrySSBO geometry_data = geometry_buffer[instance_data.geometry_buffer_offset + rp.geometryIndex];
+
+				uint vertex_offset = rp.primitiveID * 3;				
+				hit_vertex_indices.xyz = uvec3(0, 1, 2) + vertex_offset;
+
+				if(geometry_data.has_indices)
+					for(uint i=0; i<3; i++)
+						hit_vertex_indices[i] = index_buffer[geometry_data.index_buffer_offset + vertex_offset + i];
+											
+				hit_vertex_indices.xyz += geometry_data.vertex_buffer_offset;
+				hit_vertex_indices.w = rp.instanceID;
+
+				vec3 hit_normal = getNormal(hit_vertex_indices);
+				float backface_check = dot(hit_normal, ray.direction);
+				if(backface_check > 0)
+				{
+#ifdef LOG_SHADER_INTERSECTIONS
+					if(ray_vertex_indices == hit_vertex_indices)
+						debugPrintfEXT("SELF intersection (depth: %d, dot: %f): %d, %d, %d", depth, backface_check, 
+						ray_vertex_indices.x,
+						ray_vertex_indices.y,
+						ray_vertex_indices.z);
+					else
+						debugPrintfEXT("hit BACKFACE (depth: %d, dot: %f): %d, %d, %d -> %d, %d, %d", depth, backface_check, 
+						ray_vertex_indices.x,
+						ray_vertex_indices.y,
+						ray_vertex_indices.z,
+						hit_vertex_indices.x,
+						hit_vertex_indices.y,
+						hit_vertex_indices.z);
+#endif
+					break;
+				}
+				seed += n + depth;
+				ray = getNextRay(hit_vertex_indices, ray.direction, ray.weight, seed);
+								
+				if(depth > 32 && instance_data.absorption > 0)
+				{
+#ifdef LOG_SHADER_INTERSECTION
+					debugPrintfEXT("depth thermination: %d", depth);
+#endif
+					ray.absorbed = true;
+				}
+						
+				if(ray.absorbed) { 
+					for(uint i=0; i<3; i++) { 
+						uint ray_vertex_index = ray_vertex_indices[i];						
+						for(uint j=0; j<3; j++)	{ 
+							uint hit_vertex_index = hit_vertex_indices[j];
+							uint transport_mat_index = linFrom2D(ray_vertex_index, hit_vertex_index, ubo.vertexCount);
+
+							scalar absorption = 0;
+
+							#ifdef USE_QUANTIZED_RAY_TRANSPORT			
+								absorption = 1.0;
+							#else
+								absorption = scalar(ray_bar_coord[i]) * scalar(hit_bar_coord[j]) * ray_weight;
+							#endif
+														
+							#ifdef FULL_TRANSPORT_IN_SHADER	
+								absorption *= vertex_emission_buffer[ray_vertex_index] * vertex_absorption_buffer[hit_vertex_index];
+							#endif
+
+							atomicAdd(transport_buffer[transport_mat_index], absorption);
+						}
+					}
+					break;
+				}
+			} 
+			else
+			{
+#ifdef LOG_SHADER_INTERSECTIONS
+				vec3 normal = getNormal(hit_vertex_indices);
+				float miss_dot = dot(normal, ray.direction);
+				debugPrintfEXT("#%d | ray MISS (depth: %d, dot: %f), bary. coord.: %f, %f, %f, normal: %f, %f, %f, dir.: %f, %f, %f",
+				gl_LaunchIDEXT.y, depth, miss_dot, hit_bar_coord.x, hit_bar_coord.y, hit_bar_coord.z,
+				normal.x, normal.y, normal.z, ray.direction.x, ray.direction.y, ray.direction.z);
+#endif
+				break;
+			}
+		}
+	}
+}
+

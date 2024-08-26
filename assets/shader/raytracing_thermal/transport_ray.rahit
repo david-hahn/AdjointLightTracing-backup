@@ -1,0 +1,59 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_ray_tracing : require
+
+#include "defines.h"
+#include "../utils/glsl/ray_tracing_utils.glsl"
+
+
+
+
+
+layout(binding = GLSL_GLOBAL_INSTANCE_DATA_BINDING, set = GLSL_GLOBAL_DESC_SET) buffer instance_ssbo { InstanceSSBO instance_buffer[]; };
+layout(binding = GLSL_GLOBAL_GEOMETRY_DATA_BINDING, set = GLSL_GLOBAL_DESC_SET) buffer geometry_ssbo { GeometrySSBO geometry_buffer[]; };
+struct vertex_s {
+	vec4	position;
+	vec4	normal;	
+	vec4	tangent;
+
+	vec2	texture_coordinates_0;
+	vec2	texture_coordinates_1;
+	vec4	color_0;
+};
+layout(binding = GLSL_GLOBAL_INDEX_BUFFER_BINDING, set = GLSL_GLOBAL_DESC_SET) buffer index_storage_buffer { uint index_buffer[]; };
+layout(binding = GLSL_GLOBAL_VERTEX_BUFFER_BINDING, set = GLSL_GLOBAL_DESC_SET) buffer vertex_storage_buffer { vertex_s vertex_buffer[]; };
+
+hitAttributeEXT vec2 hitAttribute;
+
+void main() 
+{
+	vec3 barycentricCoords = computeBarycentric(hitAttribute);
+	InstanceSSBO instance_data = instance_buffer[gl_InstanceID];
+	GeometrySSBO geometry_data = geometry_buffer[instance_data.geometry_buffer_offset + gl_GeometryIndexEXT];
+
+	
+	if(geometry_data.baseColorFactor.a == 0) ignoreIntersectionEXT;
+	else if(geometry_data.baseColorTexIdx != -1){
+		uint idx_0 = 0;
+		uint idx_1 = 0;
+		uint idx_2 = 0;
+		if(geometry_data.has_indices){
+			idx_0 = index_buffer[geometry_data.index_buffer_offset + (gl_PrimitiveID * 3) + 0];
+			idx_1 = index_buffer[geometry_data.index_buffer_offset + (gl_PrimitiveID * 3) + 1];
+			idx_2 = index_buffer[geometry_data.index_buffer_offset + (gl_PrimitiveID * 3) + 2];
+		} else {
+			idx_0 = (gl_PrimitiveID * 3) + 0;
+			idx_1 = (gl_PrimitiveID * 3) + 1;
+			idx_2 = (gl_PrimitiveID * 3) + 2;
+		}
+
+		vec2 uv_0 = vertex_buffer[geometry_data.vertex_buffer_offset + idx_0].texture_coordinates_0.xy;
+		vec2 uv_1 = vertex_buffer[geometry_data.vertex_buffer_offset + idx_1].texture_coordinates_0.xy;
+		vec2 uv_2 = vertex_buffer[geometry_data.vertex_buffer_offset + idx_2].texture_coordinates_0.xy;
+		vec2 uv = uv_0 * barycentricCoords.x + uv_1 * barycentricCoords.y + uv_2 * barycentricCoords.z;
+
+		if(texture(tex[geometry_data.baseColorTexIdx], uv).a  <= geometry_data.alphaCutoff) ignoreIntersectionEXT;
+	}
+	
+}

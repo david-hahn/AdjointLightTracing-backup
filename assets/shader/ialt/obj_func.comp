@@ -1,0 +1,54 @@
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_arithmetic: enable
+#extension GL_EXT_shader_atomic_float : enable
+#extension GL_EXT_debug_printf : enable
+#include "defines.h"
+
+layout(constant_id = 0) const uint SPHERICAL_HARMONIC_ORDER = 1;
+layout(constant_id = 1) const uint ENTRIES_PER_VERTEX = 3;
+layout(constant_id = 2) const uint USE_UNPHYSICAL_NICE_PREVIEW = 0;
+
+layout(push_constant) uniform PushConstant{
+    layout(offset = 0) uint vertexCount;
+};
+
+layout(binding = OBJ_DESC_RADIANCE_BUFFER_BINDING, set = 0) buffer restrict radiance_storage_buffer { float radiance_buffer[]; };
+layout(binding = OBJ_DESC_TARGET_RADIANCE_BUFFER_BINDING, set = 0) readonly restrict buffer target_radiance_storage_buffer { float target_radiance_buffer[]; };
+layout(binding = OBJ_DESC_TARGET_RADIANCE_WEIGHTS_BUFFER_BINDING, set = 0) readonly restrict buffer target_radiance_weight_storage_buffer { float target_radiance_weights_buffer[]; };
+layout(binding = OBJ_DESC_AREA_BUFFER_BINDING, set = 0) readonly restrict buffer vertex_area_buffer { float vtxArea[]; };
+layout(binding = OBJ_DESC_CHANNEL_WEIGHTS_BUFFER_BINDING, set = 0) readonly restrict buffer channel_weights_storage_buffer { float channel_weights_buffer[]; };
+layout(binding = OBJ_DESC_PHI_BUFFER_BINDING, set = 0) writeonly restrict buffer phi_storage_buffer { double phi_buffer[]; };
+layout(binding = OBJ_DESC_VERTEX_COLOR_BUFFER_BINDING, set = 0) readonly restrict buffer vertex_color_buffer { float vtxColor[]; };
+
+layout(local_size_x = OBJ_FUNC_WORKGROUP_SIZE) in;
+void main() {
+    if (gl_GlobalInvocationID.x >= vertexCount) {
+        
+        return;
+    }
+
+    const uvec2 coord = gl_GlobalInvocationID.xy;
+    const uint idx = coord.x * ENTRIES_PER_VERTEX + coord.y;
+    float xMinusTarget;
+    if( USE_UNPHYSICAL_NICE_PREVIEW == 0){
+        xMinusTarget = radiance_buffer[idx] - target_radiance_buffer[idx];
+    }else if( USE_UNPHYSICAL_NICE_PREVIEW == 1){
+        xMinusTarget = radiance_buffer[idx] * vtxColor[coord.x *3+(coord.y % 3)] - target_radiance_buffer[idx];
+    }
+
+    const float aDx = xMinusTarget * target_radiance_weights_buffer[coord.x] * channel_weights_buffer[coord.y] * vtxArea[coord.x];
+    const double phi = 0.5f * xMinusTarget * aDx;
+    
+    if( USE_UNPHYSICAL_NICE_PREVIEW == 0){
+        radiance_buffer[idx] = aDx;
+    }else if( USE_UNPHYSICAL_NICE_PREVIEW == 1){
+        radiance_buffer[idx] = aDx * vtxColor[coord.x *3+(coord.y % 3)];
+    }
+
+    const double partial_sum = subgroupAdd(phi);
+    if (subgroupElect()) {
+        atomicAdd(phi_buffer[0], partial_sum);
+    }
+}
